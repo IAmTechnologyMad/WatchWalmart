@@ -61,10 +61,6 @@ def background_task(interval_seconds=300):
             log.error("❌ Error in background task: %s", e)
         time.sleep(interval_seconds)
 
-# Start background thread automatically
-bg_thread = threading.Thread(target=background_task, daemon=True)
-bg_thread.start()
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -337,6 +333,10 @@ def health():
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
+# Start background thread automatically
+bg_thread = threading.Thread(target=background_task, daemon=True)
+bg_thread.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
