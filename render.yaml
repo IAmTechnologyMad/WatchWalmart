@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: walmart-stock-tracker
+    runtime: docker
+    plan: free
+    envVars:
+      - key: DISCORD_WEBHOOK_URL
+        sync: false
+      - key: PRODUCT_URL
+        sync: false
