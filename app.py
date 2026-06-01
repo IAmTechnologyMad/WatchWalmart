@@ -28,6 +28,10 @@ import tempfile
 
 # Check interval tracking – we only alert once when it *transitions* to in-stock
 LAST_STATUS_FILE = os.path.join(tempfile.gettempdir(), "last_stock_status.txt")
+DAILY_STATS_FILE = os.path.join(tempfile.gettempdir(), "daily_stock_stats.json")
+
+# Timezone for daily summary (default: US Eastern)
+SUMMARY_TIMEZONE_OFFSET = int(os.environ.get("SUMMARY_TZ_OFFSET_HOURS", "0"))  # 0 = UTC
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -46,12 +50,160 @@ log = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
-# Background Task
+# Daily Stats Tracking
 # ---------------------------------------------------------------------------
 
-def background_task(interval_seconds=300):
+_stats_lock = threading.Lock()
+
+
+def _load_daily_stats() -> dict:
+    """Load today's stats from disk, or return fresh stats if it's a new day."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        with open(DAILY_STATS_FILE, "r") as f:
+            stats = json.load(f)
+        if stats.get("date") == today:
+            return stats
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    # New day or no file – return fresh stats
+    return {
+        "date": today,
+        "total_checks": 0,
+        "in_stock_transitions": 0,
+        "in_stock_timestamps": [],
+        "out_of_stock_count": 0,
+        "errors": 0,
+        "last_check_time": None,
+        "last_status": None,
+    }
+
+
+def _save_daily_stats(stats: dict):
+    """Persist daily stats to disk."""
+    with open(DAILY_STATS_FILE, "w") as f:
+        json.dump(stats, f)
+
+
+def record_check(in_stock: bool, transitioned_to_in_stock: bool, error: bool = False):
+    """Thread-safe recording of a stock check result."""
+    with _stats_lock:
+        stats = _load_daily_stats()
+        stats["total_checks"] += 1
+        stats["last_check_time"] = datetime.now(timezone.utc).isoformat()
+        stats["last_status"] = "IN_STOCK" if in_stock else "OUT_OF_STOCK"
+        if error:
+            stats["errors"] += 1
+        elif transitioned_to_in_stock:
+            stats["in_stock_transitions"] += 1
+            stats["in_stock_timestamps"].append(
+                datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+            )
+        elif not in_stock:
+            stats["out_of_stock_count"] += 1
+        _save_daily_stats(stats)
+        log.info("📈 Daily stats updated: checks=%d, in_stock_transitions=%d, errors=%d",
+                 stats["total_checks"], stats["in_stock_transitions"], stats["errors"])
+
+
+def send_daily_summary():
+    """Send the daily summary embed to Discord and reset stats."""
+    with _stats_lock:
+        stats = _load_daily_stats()
+        # Reset for the new day
+        _save_daily_stats({
+            "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "total_checks": 0,
+            "in_stock_transitions": 0,
+            "in_stock_timestamps": [],
+            "out_of_stock_count": 0,
+            "errors": 0,
+            "last_check_time": None,
+            "last_status": None,
+        })
+
+    if not DISCORD_WEBHOOK_URL:
+        log.warning("DISCORD_WEBHOOK_URL not set – skipping daily summary")
+        return
+
+    transitions = stats["in_stock_transitions"]
+    total = stats["total_checks"]
+    errors = stats["errors"]
+    timestamps = stats["in_stock_timestamps"]
+
+    if transitions > 0:
+        color = 0x00FF00  # Green – product came in stock at least once
+        status_emoji = "🟢"
+        stock_summary = f"The product came **in stock {transitions} time(s)** today."
+    else:
+        color = 0xFF6600  # Orange – never in stock
+        status_emoji = "🔴"
+        stock_summary = "The product was **never in stock** today."
+
+    # Build the timestamps field
+    if timestamps:
+        ts_text = "\n".join(f"• {t}" for t in timestamps)
+    else:
+        ts_text = "None"
+
+    embed = {
+        "title": f"{status_emoji} Daily Stock Summary – {stats['date']}",
+        "description": stock_summary,
+        "color": color,
+        "fields": [
+            {
+                "name": "🔍 Total Checks",
+                "value": str(total),
+                "inline": True,
+            },
+            {
+                "name": "📦 In-Stock Events",
+                "value": str(transitions),
+                "inline": True,
+            },
+            {
+                "name": "⚠️ Errors",
+                "value": str(errors),
+                "inline": True,
+            },
+            {
+                "name": "🕐 In-Stock Times",
+                "value": ts_text,
+                "inline": False,
+            },
+            {
+                "name": "🔗 Product",
+                "value": f"[View on Walmart]({PRODUCT_URL})",
+                "inline": False,
+            },
+        ],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "footer": {"text": "Walmart Stock Tracker – Daily Summary"},
+    }
+
+    payload = {
+        "username": "Walmart Stock Alert",
+        "content": f"📋 **Daily Summary for {stats['date']}**",
+        "embeds": [embed],
+    }
+
+    try:
+        resp = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
+        if resp.status_code in (200, 204):
+            log.info("✅ Daily summary sent to Discord for %s", stats["date"])
+        else:
+            log.error("Daily summary webhook failed: %s – %s", resp.status_code, resp.text)
+    except Exception as exc:
+        log.error("Failed to send daily summary: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Background Tasks
+# ---------------------------------------------------------------------------
+
+def background_task(interval_seconds=1800):
     """Runs the stock check periodically in the background."""
-    log.info("🚀 Background task started. Will check stock every %d seconds.", interval_seconds)
+    log.info("🚀 Background stock checker started. Will check every %d seconds.", interval_seconds)
     while True:
         try:
             log.info("⏰ Background timer triggered. Initiating stock check...")
@@ -60,6 +212,28 @@ def background_task(interval_seconds=300):
         except Exception as e:
             log.error("❌ Error in background task: %s", e)
         time.sleep(interval_seconds)
+
+
+def daily_summary_task():
+    """Sends a daily summary to Discord at midnight UTC, then sleeps until next midnight."""
+    log.info("📋 Daily summary task started. Will send summary at midnight UTC each day.")
+    while True:
+        try:
+            # Calculate seconds until next midnight UTC
+            now = datetime.now(timezone.utc)
+            from datetime import timedelta
+            tomorrow = now + timedelta(days=1)
+            next_midnight = tomorrow.replace(hour=0, minute=0, second=0, microsecond=0)
+            sleep_seconds = (next_midnight - now).total_seconds()
+            log.info("📋 Next daily summary in %.0f seconds (at %s UTC)",
+                     sleep_seconds, next_midnight.strftime("%Y-%m-%d %H:%M:%S"))
+            time.sleep(sleep_seconds)
+
+            log.info("📋 Midnight UTC reached. Sending daily summary...")
+            send_daily_summary()
+        except Exception as e:
+            log.error("❌ Error in daily summary task: %s", e)
+            time.sleep(60)  # Retry after a minute on error
 
 
 # ---------------------------------------------------------------------------
@@ -281,15 +455,18 @@ def check_stock() -> dict:
     log.info("🔄 Previous status: %s | Current status: %s", last_status, current_status)
 
     # Only notify on transition: was out-of-stock (or first check) → now in-stock
+    transitioned = False
     if product_info["in_stock"] and last_status != "IN_STOCK":
-        log.info("🎉 Product is IN STOCK! Sending Discord notification...")
+        log.info("🎉 Product TRANSITIONED to IN STOCK! Sending Discord notification...")
         notified = send_discord_notification(product_info)
+        transitioned = True
     elif product_info["in_stock"]:
         log.info("✅ Product still in stock – no new notification needed")
     else:
-        log.info("❌ Product is out of stock")
+        log.info("❌ Product is out of stock – no notification sent")
 
     save_status(current_status)
+    record_check(in_stock=product_info["in_stock"], transitioned_to_in_stock=transitioned)
 
     return {
         "success": True,
@@ -334,9 +511,12 @@ def health():
 # Entry point
 # ---------------------------------------------------------------------------
 
-# Start background thread automatically
+# Start background threads automatically
 bg_thread = threading.Thread(target=background_task, daemon=True)
 bg_thread.start()
+
+summary_thread = threading.Thread(target=daily_summary_task, daemon=True)
+summary_thread.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
