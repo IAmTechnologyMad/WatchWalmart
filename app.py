@@ -236,6 +236,34 @@ def daily_summary_task():
             time.sleep(60)  # Retry after a minute on error
 
 
+def self_ping_task(interval_seconds=600):
+    """Pings itself periodically to prevent Render from suspending on the free plan."""
+    # Hardcoded default fallback to your Render URL
+    self_url = os.environ.get("SELF_PING_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "https://watchwalmart.onrender.com"
+    
+    # Only run the self-ping task if we are running in a production/Render environment
+    # to avoid making web calls when just running quick tests locally
+    if not os.environ.get("RENDER") and not os.environ.get("SELF_PING_URL"):
+        log.info("ℹ️ Running locally. Self-ping task skipped to avoid unnecessary network calls.")
+        return
+
+    # Ensure URL is clean and pings the health check endpoint
+    ping_url = f"{self_url.rstrip('/')}/health"
+    log.info("🌐 Self-ping task started. Will ping %s every %d seconds to keep awake.", ping_url, interval_seconds)
+    
+    # Wait 60 seconds after startup before the first ping to let the app fully initialize
+    time.sleep(60)
+    
+    while True:
+        try:
+            log.info("📡 Sending self-ping to %s...", ping_url)
+            resp = requests.get(ping_url, timeout=15)
+            log.info("🟢 Self-ping response status: %s", resp.status_code)
+        except Exception as e:
+            log.error("⚠️ Self-ping failed: %s", e)
+        time.sleep(interval_seconds)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -517,6 +545,9 @@ bg_thread.start()
 
 summary_thread = threading.Thread(target=daily_summary_task, daemon=True)
 summary_thread.start()
+
+ping_thread = threading.Thread(target=self_ping_task, daemon=True)
+ping_thread.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
